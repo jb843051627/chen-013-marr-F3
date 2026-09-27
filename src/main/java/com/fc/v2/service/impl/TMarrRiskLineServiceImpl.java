@@ -1,6 +1,7 @@
 package com.fc.v2.service.impl;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
@@ -10,10 +11,17 @@ import org.springframework.stereotype.Service;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.fc.v2.mapper.auto.TMarrRiskLineMapper;
 import com.fc.v2.model.auto.TMarrRiskLine;
+import com.fc.v2.model.custom.MarrRiskQuery;
+import com.fc.v2.model.custom.MarrRiskVerdict;
 import com.fc.v2.service.ITMarrRiskLineService;
 
 /**
- * 婚姻家庭辅导风险评估判据线 Service业务层处理（rule-eval 形状）
+ * 婚姻家庭辅导风险评估判据线 Service业务层处理（rule-eval 形状：只取不算改，无增删改）
+ *
+ * 时段比较一律在 Java 内做（{@link #standsAt}）：JDBC 的 serverTimezone 与本机时区
+ * 不对称，把 java.util.Date 作 SQL 参数绑回去会整体偏移，使"切换当日"这类边界随机错档
+ * （实测踩到）；判据读回内存后比较就没有这个问题。判据是版本不多的参照表，
+ * 全量读回再过滤代价可忽略，换来的是交接当日口径只此一处、可直接单测。
  *
  * @author fuce
  * @date 2026-09-14
@@ -21,62 +29,65 @@ import com.fc.v2.service.ITMarrRiskLineService;
 @Service
 public class TMarrRiskLineServiceImpl implements ITMarrRiskLineService {
 
-    /** 优先级降序；并列按 ruleCode 降序（确定性） */
-    private static final Comparator<TMarrRiskLine> PRIORITY_THEN_CODE_DESC = new Comparator<TMarrRiskLine>() {
-        @Override
-        public int compare(TMarrRiskLine a, TMarrRiskLine b) {
-            int pa = a.getPriority() == null ? 0 : a.getPriority();
-            int pb = b.getPriority() == null ? 0 : b.getPriority();
-            if (pa != pb) {
-                return pb - pa;
-            }
-            String ca = a.getRuleCode() == null ? "" : a.getRuleCode();
-            String cb = b.getRuleCode() == null ? "" : b.getRuleCode();
-            return cb.compareTo(ca);
-        }
-    };
+    /** 分值成体统区间 [0, 100]：负数、四位九这类越界的不硬算，退回辅导员手上重填 */
+    static final BigDecimal SCORE_MIN = BigDecimal.ZERO;
+    static final BigDecimal SCORE_MAX = new BigDecimal("100");
+
+    /**
+     * 抢档口径（同一份评估被多条判据同时够着时）：顺位大的先说话；
+     * 顺位也相同，取代号在后的那一条；再相同（同代号多版同日均够着）
+     * 按启用之日新的在先、主键大的在先——保证今天算和明天算是同一个结果。
+     */
+    static final Comparator<TMarrRiskLine> PRIORITY_THEN_CODE_DESC = Comparator
+            .comparing((TMarrRiskLine r) -> r.getPriority() == null ? 0 : r.getPriority(),
+                    Comparator.reverseOrder())
+            .thenComparing(r -> r.getRuleCode() == null ? "" : r.getRuleCode(),
+                    Comparator.reverseOrder())
+            .thenComparing(TMarrRiskLine::getEffStart,
+                    Comparator.nullsLast(Comparator.reverseOrder()))
+            .thenComparing(TMarrRiskLine::getId,
+                    Comparator.nullsLast(Comparator.reverseOrder()));
 
     @javax.annotation.Resource
     private TMarrRiskLineMapper marrRiskLineMapper;
 
-    /**
-     * 时段比较统一走**墙钟字符串**（yyyy-MM-dd HH:mm:ss）+ 字符串绑定：
-     * JDBC 的 serverTimezone 与本机时区不对称，直接把 java.util.Date 作参数会整体偏移，
-     * 使边界判定在"切换当日"这类用例上随机错档（实测踩到）。
-     */
-    private static String ts(Date d) {
-        return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(d);
-    }
-
     @Override
     public TMarrRiskLine selectTMarrRiskLineById(Long id) {
-        return this.marrRiskLineMapper.selectById(id);
-    }
-
-    @Override
-    public List<TMarrRiskLine> listAvailable(Date at) {
-        if (at == null) {
-            return new java.util.ArrayList<TMarrRiskLine>();
+        if (id == null) {
+            return null;
         }
-        return this.marrRiskLineMapper.selectList(new QueryWrapper<TMarrRiskLine>().eq("del_flag", 0));
+        return this.marrRiskLineMapper.selectOne(new QueryWrapper<TMarrRiskLine>()
+                .eq("id", id).eq("del_flag", 0));
     }
 
     @Override
     public int evaluate(String ruleCode, BigDecimal input, Date at) {
-        if (ruleCode == null || ruleCode.trim().isEmpty() || input == null || at == null) {
-            return 0;
+        return evaluate(new MarrRiskQuery(ruleCode, input, at)).getLevel();
+    }
+
+    @Override
+    public MarrRiskVerdict evaluate(MarrRiskQuery query) {
+        if (query == null || query.getRuleCode() == null || query.getRuleCode().trim().isEmpty()
+                || query.getAt() == null) {
+            // 代号或评估之日缺失：认不出任何判据，直说无判据可依
+            return MarrRiskVerdict.noRule();
         }
-        TMarrRiskLine rule = findRule(ruleCode, at);
-        return levelOf(rule, input);
+        if (!scoreSane(query.getInput())) {
+            // 分值本身不成体统：别硬算，送回辅导员手上重填
+            return MarrRiskVerdict.invalidScore();
+        }
+        TMarrRiskLine rule = findRule(query.getRuleCode(), query.getAt());
+        if (rule == null) {
+            return MarrRiskVerdict.noRule();
+        }
+        // 档位连同代号、该条启用之日一块压在结论上
+        return MarrRiskVerdict.ok(levelOf(rule, query.getInput()), rule.getRuleCode(),
+                rule.getEffStart());
     }
 
     @Override
     public int evaluateTop(BigDecimal input, Date at) {
-        if (input == null || at == null) {
-            return 0;
-        }
-        if (input.compareTo(BigDecimal.ZERO) < 0
-                || input.compareTo(new BigDecimal("100")) > 0) {
+        if (at == null || !scoreSane(input)) {
             return 0;
         }
         List<TMarrRiskLine> avail = listAvailable(at);
@@ -87,64 +98,99 @@ public class TMarrRiskLineServiceImpl implements ITMarrRiskLineService {
     }
 
     @Override
+    public List<TMarrRiskLine> listAvailable(Date at) {
+        List<TMarrRiskLine> standing = new ArrayList<TMarrRiskLine>();
+        if (at == null) {
+            return standing;
+        }
+        for (TMarrRiskLine r : this.marrRiskLineMapper
+                .selectList(new QueryWrapper<TMarrRiskLine>().eq("del_flag", 0))) {
+            if (standsAt(r, at)) {
+                standing.add(r);
+            }
+        }
+        standing.sort(PRIORITY_THEN_CODE_DESC);
+        return standing;
+    }
+
+    @Override
+    public List<TMarrRiskLine> listVersions(String ruleCode) {
+        if (ruleCode == null || ruleCode.trim().isEmpty()) {
+            return new ArrayList<TMarrRiskLine>();
+        }
+        return this.marrRiskLineMapper.selectList(new QueryWrapper<TMarrRiskLine>()
+                .eq("del_flag", 0).eq("rule_code", ruleCode)
+                .orderByDesc("eff_start").orderByDesc("id"));
+    }
+
+    @Override
     public boolean usable(Long id, Date at) {
         if (id == null || at == null) {
             return false;
         }
         TMarrRiskLine r = this.marrRiskLineMapper.selectById(id);
-        return r != null;
+        return r != null && r.getDelFlag() != null && r.getDelFlag() == 0 && standsAt(r, at);
     }
 
     @Override
     public int countAvailable(Date at) {
-        if (at == null) {
-            return 0;
-        }
-        return this.marrRiskLineMapper
-                .selectList(new QueryWrapper<TMarrRiskLine>().eq("del_flag", 0)).size();
+        return listAvailable(at).size();
     }
 
+    /**
+     * 定位 at 当日站着的那一条：只认窗口够着的——去年腊月的活按去年腊月站着的那条算，
+     * 翻不到就直说无判据可依，隔三差五邻近日子上的那几条不许拿来顶。
+     * 多条同时够着按抢档口径定一条。情形记号（现行/已停用）仅供人读，取用只认窗口，
+     * 否则补做的活永远翻不回已让位的旧版。
+     */
     private TMarrRiskLine findRule(String ruleCode, Date at) {
-        List<TMarrRiskLine> hit = this.marrRiskLineMapper.selectList(new QueryWrapper<TMarrRiskLine>()
-                .eq("del_flag", 0).eq("rule_code", ruleCode));
-        TMarrRiskLine newest = null;
-        for (TMarrRiskLine r : hit) {
-            if (newest == null || r.getEffEnd() == null) {
-                newest = r;
-            } else if (newest.getEffEnd() != null && r.getEffEnd().after(newest.getEffEnd())) {
-                newest = r;
+        List<TMarrRiskLine> hit = new ArrayList<TMarrRiskLine>();
+        for (TMarrRiskLine r : this.marrRiskLineMapper.selectList(new QueryWrapper<TMarrRiskLine>()
+                .eq("del_flag", 0).eq("rule_code", ruleCode))) {
+            if (standsAt(r, at)) {
+                hit.add(r);
             }
         }
-        return newest;
-    }
-
-    /** 阈值解析：档案为主、明细覆盖；两者皆缺返回 null（调用方按不可用处理），精度统一 2 位 */
-    private BigDecimal resolveLimit(TMarrRiskLine r, int tier) {
-        if (tier == 1) {
-            return r.getTh1Max();
+        if (hit.isEmpty()) {
+            return null;
         }
-        if (tier == 2) {
-            return r.getTh2Max();
+        hit.sort(PRIORITY_THEN_CODE_DESC);
+        return hit.get(0);
+    }
+
+    /**
+     * 交接口径（全系统只此一套）：启用之日当天即站着；交棒之日不含——
+     * 旧条管到交棒前一刻，新条从交棒之日零点起算；交棒之日空着=尚未交棒，现行。
+     */
+    static boolean standsAt(TMarrRiskLine rule, Date at) {
+        if (rule == null || at == null || rule.getEffStart() == null) {
+            return false;
         }
-        return r.getTh3Max();
+        if (rule.getEffStart().after(at)) {
+            return false;
+        }
+        return rule.getEffEnd() == null || rule.getEffEnd().after(at);
     }
 
-    /** 档案级默认阈值（明细未维护时的回退来源） */
-    private BigDecimal defaultThreshold(TMarrRiskLine r, int tier) {
-        return r.getTh1Max();
+    /** 分值成体统才给算：没填的、负数、过百（四位九这类）一并退回重填 */
+    static boolean scoreSane(BigDecimal input) {
+        return input != null
+                && input.compareTo(SCORE_MIN) >= 0
+                && input.compareTo(SCORE_MAX) <= 0;
     }
 
-    /** 分档：等于上限取高一档 */
-    private int levelOf(TMarrRiskLine rule, BigDecimal input) {
-        if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) <= 0) {
+    /**
+     * 算档：挨着界就算高档——与一档界一般高记二档，与二档界一般高记三档；
+     * 越过三档那道界的也记三档，没有四档；第三格空着=不设界，顺着二档往下走，
+     * 不是没人认领的断档。
+     */
+    static int levelOf(TMarrRiskLine rule, BigDecimal input) {
+        if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) < 0) {
             return 1;
         }
-        if (rule.getTh2Max() != null && input.compareTo(rule.getTh2Max()) <= 0) {
+        if (rule.getTh2Max() != null && input.compareTo(rule.getTh2Max()) < 0) {
             return 2;
         }
-        if (rule.getTh3Max() != null && input.compareTo(rule.getTh3Max()) <= 0) {
-            return 3;
-        }
-        return 4;
+        return 3;
     }
 }
